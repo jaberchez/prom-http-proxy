@@ -1,0 +1,101 @@
+#! /usr/bin/python3
+
+###################################################################################################################
+# Descripcion: Example API REST
+#
+# API:         - /api/v1/root
+#              - /api/v1/health
+###################################################################################################################
+
+# Imports
+#------------------------------------------------------------------------------------------------------------------
+from flask import Flask, abort, jsonify, make_response, request
+
+import os
+import sys
+import re
+import signal
+import json
+import urllib
+#------------------------------------------------------------------------------------------------------------------
+
+# Variables
+#------------------------------------------------------------------------------------------------------------------
+app     = Flask(__name__)
+#------------------------------------------------------------------------------------------------------------------
+
+# Functions
+#==================================================================================================================
+# Description: Endpoint for kubernetes's health checks (this script runs as container in kubernetes)
+# Parameters:  None
+# Return:      Result in json format
+
+@app.route('/api/v1/health', methods = ['GET'])
+def get_health_check_v1():
+   if request.method == 'GET':
+      return jsonify({'result': 'Service UP and Running'}), 200
+   else:
+      print_console("[ERROR] HTTP verb not allow")
+      return jsonify({'message':'HTTP verb not allow'}), 400
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Endpoint for root
+# Parameters:  None
+# Return:      Result in json format
+
+@app.route('/api/v1/root', methods = ['GET'])
+def root_v1():
+   return jsonify({'message':'Root endpoint OK'}), 200
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Handle signals
+# Parameters:  Signal and frame of the object
+# Return:      Nothing, just exit
+
+def signal_handler(sig, frame):
+   name_signal = ''
+
+   if sig == 2:
+      name_signal = "SIGINT"
+   elif sig == 15:
+      name_signal = "SIGTERM"
+   else:
+      name_signal = "UNKNOWN"
+
+   print("\nCatch signal: " + name_signal)
+   sys.exit(0)
+#==================================================================================================================
+
+# Main
+#******************************************************************************************************************
+if __name__ == '__main__':
+   # Captura de signals
+   signal.signal(signal.SIGTERM, signal_handler)
+   signal.signal(signal.SIGINT,  signal_handler)
+
+   # These environment variables allow to change some aspects of the application from kubernetes
+   # without recreate the docker image
+   app_debug  = os.environ.get('APP_DEBUG')
+   app_port   = os.environ.get('APP_PORT', 8080)
+
+   if app_debug == None:
+      app_debug = False
+   elif app_debug.lower() == 'true':
+      app_debug = True
+   elif app_debug.lower() == 'false':
+      app_debug = False
+   else:
+      print("ERROR: APP_DEBUG environment variable must be True or False")
+      sys.exit(1)
+
+   if not re.match(r'^\d+$', str(app_port)):
+      print("ERROR: APP_PORT environment variable must be numeric")
+      sys.exit(1)
+   else:
+      app_port = int(app_port)
+
+   # Run the application
+   app.run(host = '0.0.0.0', port = int(app_port), debug = app_debug)
+#******************************************************************************************************************

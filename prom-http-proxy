@@ -1,0 +1,787 @@
+#! /usr/bin/python3
+
+###################################################################################################################
+# Descripcion: HTTP proxy with metrics for Prometheus
+#
+# Departament: Innovation 
+###################################################################################################################
+
+# Imports
+#------------------------------------------------------------------------------------------------------------------
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
+
+import socket
+import threading
+import os
+import sys
+import re
+import signal
+import time
+import logging
+#------------------------------------------------------------------------------------------------------------------
+
+# Variables and constants
+#------------------------------------------------------------------------------------------------------------------
+BUFSIZE                = 4096
+DEFAULT_PORT           = 8080
+DEFAULT_WEB_SEVER_PORT = 8081
+LISTEN_QUEUE           = 10
+DEFAULT_WEB_SEVER      = 'localhost'
+DEFAULT_APP_DEBUG      = False
+HEALTH_CHECK_ENDPOINT  = '/-/health'
+METRICS_ENDPOINT       = '/metrics'
+
+DEBUG_LEVEL            = 'DEBUG'
+INFO_LEVEL             = 'INFO'
+WARNING_LEVEL          = 'WARNING'
+ERROR_LEVEL            = 'ERROR'
+CRITICAL_LEVEL         = 'CRITICAL'
+DEFAULT_LOG_LEVEL      = INFO_LEVEL
+
+app_name               = None
+ms_name                = None
+app_port               = DEFAULT_PORT
+
+web_server_port        = DEFAULT_WEB_SEVER_PORT
+
+web_server             = DEFAULT_WEB_SEVER
+app_debug              = DEFAULT_APP_DEBUG
+
+log_level              = DEFAULT_LOG_LEVEL
+
+# Compiled regex
+reg_content_length     = re.compile(r'^content-length:')
+reg_http_response      = re.compile(r'^HTTP/.+\s+\d{3}\s+(.+)')
+reg_digit              = re.compile(r'^\d+$')
+reg_trailing_spaces    = re.compile(r'^\s+|\s+$')
+reg_spaces             = re.compile(r'\s+')
+
+# Prometheus metrics
+ENDPOINT_REQUEST_TOTAL      = Counter(
+    'microservice_endpoint_request_total', 'App Request Count',
+    ['app_name', 'ms_name', 'method', 'endpoint', 'http_status', 'msg']
+)
+
+BYTES_TOTAL                 = Counter(
+    'microservice_bytes_total', 'App Request Bytes Total',
+    ['app_name', 'ms_name', 'endpoint']
+)
+
+REQUEST_LATENCY             = Histogram('microservice_request_latency_seconds', 'Request latency',
+    ['app_name', 'ms_name', 'endpoint']
+)
+#------------------------------------------------------------------------------------------------------------------
+
+#==================================================================================================================
+# Description: Handle signals
+# Parameters:  Signal and frame of the object
+# Return:      Nothing, just exit
+
+def signal_handler(sig, frame):
+   name_signal = ''
+
+   if sig == 2:
+      name_signal = "SIGINT"
+   elif sig == 15:
+      name_signal = "SIGTERM"
+   else:
+      name_signal = "UNKNOWN"
+
+   print("\nCatch signal: " + name_signal)
+
+   sys.exit(0)
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Main function
+# Parameters:  None
+# Return:      Nothing, if there is any problem exit the script
+
+def main():
+   try:
+       # Create the main socket
+       main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+       main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+   
+       # Bind the socket to all addresses and port
+       main_sock.bind(('', app_port))
+   
+       # Listening
+       main_sock.listen(LISTEN_QUEUE)
+
+   except socket.error as e:
+     if main_sock:
+         main_sock.close()
+
+     log(CRITICAL_LEVEL, "Could not create the main socket: {}".format(e))
+     sys.exit(1)
+ 
+   # Get the connection from client
+   while True:
+      sock_client, client_addr = main_sock.accept()
+ 
+      if app_debug:
+         log(DEBUG_LEVEL, "Call handle_client() with no threads")
+         handle_client(sock_client, client_addr)
+      else:
+         log(DEBUG_LEVEL, "Call handle_client() in new thread")
+
+         # Create a thread to handle request
+         t = threading.Thread(target=handle_client, args=(sock_client, client_addr))
+         t.daemon = True
+         t.start()
+ 
+   server_sock.close()
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Handle client connection
+# Parameters:  Socket client and tuple client_addr
+# Return:      Nothing
+
+def handle_client(sock_client, client_addr):
+   start_time         = time.time()
+   sock_web_server    = None
+   error              = False
+
+   chunk              = ''
+   data               = ''
+
+   msg                = ''
+   log_msg            = ''
+   header_new         = ''
+
+   bytes_sended       = 0
+   total_bytes_sended = 0
+
+   res_client         = {}
+   res_web_server     = {}
+   res                = {}
+
+   level              = INFO_LEVEL
+
+   log(DEBUG_LEVEL, "Connection from {}".format(client_addr[0]))
+
+   # Get request from client
+   res_client = get_request_from_client(sock_client)
+
+   if res_client['return_code'] == 0:
+      sock_client.close()
+      return
+
+   if res_client['return_code'] == -1:
+      sock_client.close()
+
+      end_time = time.time()
+
+      log(ERROR_LEVEL, "{} {}".format(client_addr[0], res_client['msg']))
+      return
+
+   # Log the client request
+   log(DEBUG_LEVEL, "{} {}".format(client_addr[0], res_client['request']))
+
+   # Check the endpoint
+   if res_client['method'].lower() == 'get' and re.match(r'^{}/?$'.format(HEALTH_CHECK_ENDPOINT), res_client['endpoint']):
+      # Health check endpoint
+      return http_response('health_check', sock_client, client_addr[0], res_client, start_time)
+   elif res_client['method'].lower() == 'get' and re.match(r'^{}/?$'.format(METRICS_ENDPOINT), res_client['endpoint']):
+      # Metrics endpoint
+      return http_response('metrics', sock_client, client_addr[0], res_client, start_time)
+      
+   # Create web server socket and connect
+   try:
+      sock_web_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock_web_server.connect((web_server, web_server_port))
+   except socket.error as e:
+      sock_client.close()
+
+      if sock_web_server:
+         sock_web_server.close()
+
+      log(ERROR_LEVEL, "Problems connecting to web server: {}".format(e))
+      return
+
+   # Add some HTTP headers to send to web server
+   header_new  = res_client['header']
+   header_new  = header_new[:len(header_new) - 2] # Remove one CRLF (\r\n)
+   header_new += "X-Forwarded-For: {}\r\n\r\n".format(client_addr[0])
+
+   log(DEBUG_LEVEL, "Header to send to web server: {}".format(header_new.encode('utf-8')))
+
+   try:
+      # Send de new header to web server
+      bytes_sended = send_data(sock_web_server, header_new)
+   except socket.error as e:
+      sock_client.close()
+      sock_web_server.close()
+
+      log(ERROR_LEVEL, "Problems sending header to web server {}".format(e))
+      return
+
+   # Inc metric bytes count
+   BYTES_TOTAL.labels(app_name, ms_name, res_client['endpoint']).inc(bytes_sended)
+
+   # We already sended the HTTP header from client to web server, check if we have 
+   # body to send 
+   if len(res_client['extra_data']) > 0:
+      data = res_client['extra_data']
+
+      while True:
+         if len(data) > 0:
+            try:
+               bytes_sended = send_data(sock_web_server, data)
+            except socket.error as e:
+               sock_client.close()
+               sock_web_server.close()
+
+               log(ERROR_LEVEL, "Problems sending body to web server {}".format(e))
+               return
+
+            total_bytes_sended += bytes_sended
+
+            BYTES_TOTAL.labels(app_name, ms_name, res_client['endpoint']).inc(bytes_sended)
+
+            # Check if we sended all data
+            if int(total_bytes_sended) >= int(res_client['content_length']):
+               # We send all data from client to web server
+               break
+
+         try:
+            # Get more data from client
+            chunk = sock_client.recv(BUFSIZE)
+
+            if not chunk:
+               # No more data from web server
+               break
+
+            data = chunk.decode('utf-8')
+         except socket.error as e:
+            sock_client.close()
+            sock_web_server.close()
+
+            log(ERROR_LEVEL, "Problems receiving data from client {}".format(e))
+            return
+
+   # Get HTTP header from web server
+   res = get_http_header(sock_web_server)
+
+   if res['return_code'] == 0:
+      sock_client.close()
+      sock_web_server.close()
+
+      return
+
+   if res['return_code'] == -1:
+      sock_client.close()
+      sock_web_server.close()
+
+      log(ERROR_LEVEL, "Problems getting header from server: {}".format(res['msg']))
+
+      return
+
+   # Parse data from web server header (the response)
+   res_web_server = parse_http_response_header(res)
+
+   if res_web_server['return_code'] == -1:
+      sock_client.close()
+      sock_web_server.close()
+
+      level    = ERROR_LEVEL
+      log_msg  = "{} {} 500 {}".format(client_addr[0], res_client['request'], res_web_server['msg'])
+
+      end_conversation(sock_client, sock_web_server, level, log_msg, app_name, ms_name, 
+                  res_client['method'], res_client['endpoint'], '500', res_web_server['msg'], start_time)
+
+      return
+
+   log(DEBUG_LEVEL, "Header to send from web server to client: {}".format(res_web_server['header'].encode('utf-8')))
+
+   # Send header from web server to client
+   try:
+      bytes_sended = send_data(sock_client, res_web_server['header'])
+
+   except socket.error as e:
+      sock_client.close()
+      sock_web_server.close()
+
+      log(ERROR_LEVEL, "Problems sending header from web server to client: {}".format(e))
+      return
+
+   BYTES_TOTAL.labels(app_name, ms_name, res_client['endpoint']).inc(bytes_sended)
+
+   log_msg = "{} {} {} {}".format(client_addr[0], res_client['request'], 
+             res_web_server['http_status'], res_web_server['http_msg'])
+
+   total_bytes_sended = 0
+
+   # If we have some part of the body, we send it
+   if len(res_web_server['extra_data']) > 0:
+      data = res_web_server['extra_data']
+
+      # Send body from web server to client
+      while True:
+         if len(data) > 0:
+            try:
+               bytes_sended = send_data(sock_client, data)
+               total_bytes_sended += bytes_sended
+
+               BYTES_TOTAL.labels(app_name, ms_name, res_client['endpoint']).inc(bytes_sended)
+
+               # Check if we sended all data
+               if int(total_bytes_sended) >= int(res_web_server['content_length']):
+                  # We send all data
+                  log_msg = "{} {} {} {}".format(client_addr[0], res_client['request'], 
+                            res_web_server['http_status'], res_web_server['http_msg'])
+
+                  break
+            except socket.error as e:
+               sock_client.close()
+               sock_web_server.close()
+
+               log(ERROR_LEVEL, "Problems sending body from web server to client: {}".format(e))
+               return
+               
+         try:
+            # Get more data from web server
+            chunk = sock_web_server.recv(BUFSIZE)
+
+            if not chunk:
+               # No more data from web server
+               break
+
+            data = chunk.decode('utf-8')
+         except socket.error as e:
+            sock_client.close()
+            sock_web_server.close()
+
+            log(ERROR_LEVEL, "Problems receiving data from web server {}".format(e))
+            return
+
+   # End conversation
+   end_conversation(sock_client, sock_web_server, level, log_msg, app_name, ms_name, 
+                  res_client['method'], res_client['endpoint'], res_web_server['http_status'], 
+                  res_web_server['http_msg'], start_time)
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Get metrics
+# Parameters:  None
+# Return:      Metrics
+
+def get_metrics():
+   metrics = generate_latest().decode('utf-8')
+
+   res  = "HTTP/1.1 200 OK\r\n"
+   res += "Content-Type: text/txt\r\n"
+   res += "Content-Length: {}\r\n".format(len(metrics))
+   res += "\r\n"
+   res += "{}".format(metrics)
+
+   return res
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Send data through socket
+# Parameters:  Socket and data
+# Return:      A dictionary with the result. See below the fields
+
+def send_data(sock, data):
+   bytes_sended = 0
+
+   try:
+      while bytes_sended < len(data):
+         b              = sock.send(data[bytes_sended:].encode('utf-8'))
+         bytes_sended  += b
+   except socket.error as e:
+      raise e
+
+   return bytes_sended
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Get request from client
+# Parameters:  Socket client
+# Return:      A dictionary with the result. See below the fields
+
+def get_request_from_client(sock_client):
+   chunk          = ''
+   data           = ''
+   req            = ''
+   client_request = ''
+   pos            = -1
+
+   r              = {}
+   parse_header   = {}
+
+   res            = {
+      'request':           'unknown',
+      'method':            'unknown',
+      'endpoint_complete': 'unknown',
+      'endpoint':          'unknown',
+      'header':            '',
+      'extra_data':        '',
+      'msg':               '',
+      'content_length':    0,
+      'return_code':       -1
+   }
+
+   # Get HTTP header
+   r = get_http_header(sock_client)
+
+   res['return_code'] = r['return_code']
+
+   if res['return_code'] == 0:
+      return res
+
+   if res['return_code'] == -1:
+      res['msg'] = "Problems getting header from client: {}".format(r['msg'])
+
+      return res
+
+   res['header'] = r['header']
+
+   # Copy the rest of the data (the the body part) if there is something
+   if len(r['extra_data']) > 0:
+      res['extra_data'] = r['extra_data']
+
+   # We have all header, we parse it to get the fields we need
+   parse_header = parse_http_request_header(res['header'])
+
+   # Get the request (first line of the header)
+   res['request']           = parse_header['request']
+
+   # Parse the request and get the method (GET, PUT....)
+   res['method']            = res['request'].split(' ')[0]
+
+   # Get the whole endpoint
+   res['endpoint_complete'] = res['request'].split(' ')[1]
+
+   # Find if there are parameters in the endpoint
+   pos = res['endpoint_complete'].find('?')
+
+   if pos < 0:
+      # There are not parameters
+      res['endpoint'] = res['endpoint_complete']
+   else:
+      # Remove the url parameters
+      res['endpoint'] = res['endpoint_complete'][:pos]
+
+   res['content_length'] = parse_header['content_length']
+
+   return res
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Get HTTP header
+# Parameters:  Socket
+# Return:      A dictionary with the result. See below the fields
+
+def get_http_header(sock):
+   chunk  = ''
+   data   = ''
+   pos    = -1
+
+   res    = {
+      'header':      '',
+      'extra_data':   '',
+      'msg':         '',
+      'return_code': 2
+   }
+
+   # Get the HTTP header
+   while True:
+      try:
+         # Get data from the client
+         chunk = sock.recv(BUFSIZE)
+
+         if chunk:
+            data += chunk.decode('utf-8')
+
+            # Check if we got the whole HTTP header
+            pos = data.find('\r\n\r\n')
+
+            if pos < 0:
+               # We need more data, the header is not complete
+               continue
+
+            # We have the header
+            break
+         else:
+            # The client close the connection
+            res['return_code'] = 0
+
+            return res
+      except socket.error as e:
+         # Error getting data from socket
+         res['return_code'] = -1
+         res['msg']         = "{}".format(e)
+
+         return res
+
+   # Save the header
+   res['header'] = data[:pos + 4]
+
+   # Save the extra of the data (the_body or part of it) if there is something
+   if len(data[pos + 4:]) > 0:
+      res['extra_data'] = data[pos + 4:]
+
+   return res
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Get some fields from HTTP header request
+# Parameters:  Header
+# Return:      A dictionary with the result. See below the fields
+
+def parse_http_request_header(header):
+   res    = {
+      'request':        '',
+      'content_length': 0,
+   }
+
+   # Get the request or response (first line)
+   res['request'] = header.split('\r\n')[0]
+
+   # Find the Content-Length header
+   # Notice: Usually the GET method does not contain Content-Length header, but
+   #         POST, PUT yes
+   for line in header.split('\r\n'):
+      if reg_content_length.match(line.lower()):
+         res['content_length']  = line.split(':')[1]
+         res['content_length']  = reg_spaces.sub('', res['content_length'])
+
+   return res
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Get data from the HTTP header response
+# Parameters:  Dictionary with the response
+# Return:      A dictionary with the result. See below the fields
+
+def parse_http_response_header(r):
+   res   = {
+      'http_status':    '',
+      'http_msg':       '',
+      'msg':            '',
+      'content_length': 0,
+      'return_code':    2
+   }
+
+   # Copy r ditionary to res
+   for key, value in r.items():
+      res[key] = value
+
+   lines = res['header'].split('\r\n')
+
+   for line in lines:
+      if reg_http_response.match(line):
+         # We are in the first line, the response. We parse the data
+         res['http_status'] = line.split(' ')[1]
+
+         # Message
+         res['http_msg']  = reg_http_response.sub(r'\1', line)
+         res['http_msg']  = reg_trailing_spaces.sub('', res['http_msg'])
+      elif reg_content_length.match(line.lower()):
+         res['content_length']  = line.split(':')[1]
+         res['content_length']  = reg_spaces.sub('', res['content_length'])
+
+   if len(res['http_status']) == 0:
+      res['msg']         = "HTTP code status not found"
+      res['return_code'] = -1
+
+      return res
+
+   if len(res['http_msg']) == 0:
+      res['msg']         = "HTTP Response message not found" 
+      res['return_code'] = -1
+
+      return res
+
+   return res
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Print message
+# Parameters:  Level and message
+# Return:      Nothing
+#
+# Sort:
+#    DEBUG
+#    INFO
+#    WARNING
+#    ERROR
+#    CRITICAL
+
+def log(level, msg):
+   global log_level
+
+   all_log_levels = (DEBUG_LEVEL, INFO_LEVEL, WARNING_LEVEL, ERROR_LEVEL, CRITICAL_LEVEL)
+   log_levels     = []
+   pos            = 0
+   
+   switcher = {
+      DEBUG_LEVEL:    logging.debug,
+      INFO_LEVEL:     logging.info,
+      WARNING_LEVEL:  logging.warning,
+      ERROR_LEVEL:    logging.error,
+      CRITICAL_LEVEL: logging.critical
+   }
+   
+   # Get the function to run
+   func = switcher.get(level)
+
+   # Create a new list only with the levels we can use, established in LOG_LEVEL
+   # environment variable
+   for i in range(0, len(all_log_levels)):
+      if log_level == all_log_levels[i]:
+         pos = i
+         break
+
+   if pos + 1 == len(all_log_levels):
+      # Last element, the only one
+      log_levels = all_log_levels[pos]
+   else:
+      log_levels = all_log_levels[pos:]
+
+   # Check if we have to run the function
+   # Notice: We run the function if LOG_LEVEL is the same or below in terms of sorting
+   if level in log_levels:
+      # Run
+      func("{}".format(msg))
+#==================================================================================================================
+
+#==================================================================================================================
+# Description: Finish conversation
+# Parameters:  Socket client, socket server, level, message for loggin, app name, microservice name, http method,
+#              http endpoint, http status, message for metric and start_time
+# Return:      Nothing
+
+def end_conversation(sock_client, sock_web_server, level, log_msg, app_name, ms_name, 
+                     method, endpoint, http_status, msg, start_time):
+   if sock_client:
+      sock_client.close()
+
+   if sock_web_server:
+      sock_web_server.close()
+
+   log(level, log_msg)
+
+   end_time = time.time()
+
+   # Inc prometheus count the request
+   ENDPOINT_REQUEST_TOTAL.labels(app_name, ms_name, method.upper(), endpoint, http_status, msg).inc()
+
+   # Histogram latency metric
+   REQUEST_LATENCY.labels(app_name, ms_name, endpoint).observe(end_time - start_time)
+#====================================================================================================================
+
+#====================================================================================================================
+# Description: HTTP response (specially for health check and metrics endpoints)
+# Parameters:  Endpoint type, socket client, client address, dictionary res_client and start time
+# Return:      Nothing
+
+def http_response(endpoint_type, sock_client, client_addr, res_client, start_time):
+   res          = {}
+   data         = None
+   bytes_sended = 0
+
+   if endpoint_type == 'health_check':
+      m    = "Service UP and Running"
+      data = "HTTP/1.1 200 OK\r\nContent-Type: text/text\r\nContent-Length: {}\r\n\r\n{}".format(len(m), m)
+   else:
+      data = get_metrics()
+
+   try:
+      bytes_sended = send_data(sock_client, data)
+
+      # Log the client request and response
+      log(INFO_LEVEL, "{} {} 200 OK".format(client_addr, res_client['request']))
+
+      end_time = time.time()
+
+      ENDPOINT_REQUEST_TOTAL.labels(app_name, ms_name, res_client['method'].upper(), res_client['endpoint'], '200', 'OK').inc()
+      BYTES_TOTAL.labels(app_name, ms_name, res_client['endpoint']).inc(bytes_sended)
+      REQUEST_LATENCY.labels(app_name, ms_name, res_client['endpoint']).observe(end_time - start_time)
+   except socket.error as e:
+      log(ERROR_LEVEL, "Problems response {}: {}".format(client_addr[0], e))
+   finally:
+      if sock_client:
+         sock_client.close()
+#====================================================================================================================
+
+# Main
+#********************************************************************************************************************
+if __name__ == '__main__':
+   # Catch signals
+   signal.signal(signal.SIGTERM, signal_handler)
+   signal.signal(signal.SIGINT,  signal_handler)
+
+   # Logging format
+   logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] - %(asctime)s - %(message)s', 
+                       datefmt='%m/%d/%Y %H:%M:%S')
+
+   app_name            = os.environ.get('APP_NAME')
+   ms_name             = os.environ.get('MS_NAME')
+   app_port            = os.environ.get('APP_PORT')
+   web_server          = os.environ.get('WEB_SEVER')
+   web_server_port     = os.environ.get('WEB_SEVER_PORT')
+   app_debug           = os.environ.get('APP_DEBUG')
+   log_level           = os.environ.get('LOG_LEVEL')
+
+   if log_level == None:
+      log_level = DEFAULT_LOG_LEVEL
+   elif str(log_level).upper() != DEBUG_LEVEL    and \
+        str(log_level).upper() != INFO_LEVEL     and \
+        str(log_level).upper() != WARNING_LEVEL  and \
+        str(log_level).upper() != CRITICAL_LEVEL and \
+        str(log_level).upper() != ERROR_LEVEL:
+      log_level = DEFAULT_LOG_LEVEL
+   else:
+      log_level = log_level.upper()
+
+   if app_name == None:
+      log(CRITICAL_LEVEL, 'APP_NAME not found')
+      sys.exit(1)
+   elif len(app_name) == 0:
+      log(CRITICAL_LEVEL, "APP_NAME must not be empty")
+      sys.exit(1)
+
+   if ms_name == None:
+      log(CRITICAL_LEVEL, "MS_NAME not found")
+      sys.exit(1)
+   elif len(ms_name) == 0:
+      log(CRITICAL_LEVEL, "MS_NAME must not be empty")
+      sys.exit(1)
+
+   if app_port == None:
+      app_port = DEFAULT_PORT
+   elif not reg_digit.match(str(app_port)):
+         log(CRITICAL_LEVEL, "Port must be numeric")
+         sys.exit(1)
+   else:
+      app_port = int(app_port)
+
+   if web_server == None:
+      web_server = DEFAULT_WEB_SEVER
+
+   if web_server_port == None:
+      web_server_port = DEFAULT_WEB_SEVER_PORT
+   elif not reg_digit.match(str(web_server_port)):
+         log(CRITICAL_LEVEL, "Web server port must be numeric")
+         sys.exit(1)
+   else:
+      web_server_port = int(web_server_port)
+         
+   if app_debug == None:
+      app_debug = DEFAULT_APP_DEBUG
+   elif str(app_debug).lower() != 'true' and str(app_debug).lower() != 'false':
+      log(CRITICAL_LEVEL, "Value for DEBUG not allowed: {}. Only true or false".format(app_debug))
+      sys.exit(1)
+   else:
+      if str(app_debug).lower() == 'true':
+         app_debug = True
+      else:
+         app_debug = False
+
+   main()
+#********************************************************************************************************************

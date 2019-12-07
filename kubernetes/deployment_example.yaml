@@ -1,0 +1,115 @@
+# This an example of Kubernetes Deployment to use prom-http-server as a sidecar to monitor a Flask API REST
+
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: example-flask
+  namespace: webhooks
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: example-flask
+
+  template:
+    metadata:
+      labels:
+        app: example-flask
+
+      annotations:
+        # Annotations for scraping in Prometheus
+        prometheus.io/scrape: 'true'
+        prometheus.io/port:   '8080'
+        prometheus.io/path:   '/metrics'
+
+    spec:
+      containers:
+        - name: prom-http-proxy
+          image: docker-registry/prom-http-proxy:version
+
+          env:
+            # Name of application. Each microservice should belong to an application
+            - name: APP_NAME
+              value: webhooks
+
+            # Name of microservice
+            - name: MS_NAME
+              value: example
+
+            # Port to listen
+            - name: APP_PORT
+              value: '8080'
+
+            # The server to connect to
+            - name: WEB_SEVER
+              value: localhost
+
+            # The port of the server to connect to
+            - name: WEB_SEVER_PORT
+              value: '8081'
+
+            - name: LOG_LEVEL
+              value: 'info'
+
+            # To debug without Threads set true
+            - name: APP_DEBUG
+              value: 'false'
+
+          ports:
+            - containerPort: 8080
+              name: web
+
+          livenessProbe:
+            httpGet:
+              path: '/-/health'
+              port: web
+
+            initialDelaySeconds: 5
+            timeoutSeconds: 3
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 4
+
+          readinessProbe:
+            httpGet:
+              path: '/-/health'
+              port: web
+
+            initialDelaySeconds: 5
+            timeoutSeconds: 3
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 4
+
+        - name: example-flask
+          image: example-flask
+
+          env:
+            - name: APP_PORT
+              value: '8081'
+
+          livenessProbe:
+            httpGet:
+              path: '/api/v1/health'
+              port: 8081
+
+            initialDelaySeconds: 5
+            timeoutSeconds: 3
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 4
+
+          readinessProbe:
+            httpGet:
+              path: '/api/v1/health'
+              port: 8081
+
+            initialDelaySeconds: 5
+            timeoutSeconds: 3
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 4
+#*******************************************************************************************************

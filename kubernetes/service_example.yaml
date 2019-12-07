@@ -1,0 +1,20 @@
+kind: Service
+apiVersion: v1
+
+metadata:
+  name: example
+  namespace: webhooks
+
+  labels:
+    app: "example"
+
+spec:
+  ports:
+    - name: web
+      port: 8080
+      targetPort: web
+
+  selector:
+    app: "example"
+
+  type: ClusterIP
